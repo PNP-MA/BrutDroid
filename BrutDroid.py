@@ -3,10 +3,15 @@ import sys
 import time
 import zipfile
 import shutil
+import re
+import platform
 import requests
 import subprocess
-import platform
 from OpenSSL import crypto
+
+
+def strip_ansi(text):
+    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
 try:
     from termcolor import colored, cprint
     from termcolor import force_color
@@ -295,7 +300,8 @@ def run_frida_server():
         print("\033[1;31m[✖] No emulator device detected. Start your emulator.\033[0m")
     else:
         print("\033[1;36m  Launching in background...\033[0m")
-        cmd = f'{ADB} shell su -c "nohup /data/local/tmp/frida-server > /dev/null 2>&1 &"'
+        subprocess.run(f"{ADB} root", shell=True, capture_output=True, text=True)
+        cmd = f'{ADB} shell "nohup /data/local/tmp/frida-server > /dev/null 2>&1 &"'
         subprocess.Popen(cmd, shell=True)
         time.sleep(2)  # Wait for server to start
         print("\033[1;32m[✓] Frida server running.\033[0m")
@@ -396,7 +402,13 @@ def setup_cert_with_magisk():
 
         print("\033[1;36m[•] Installing Magisk Module...\033[0m")
         subprocess.run(f"{ADB} push {filename} /data/local/tmp/", shell=True, check=True)
-        subprocess.run(f"{ADB} shell su -c 'magisk --install-module /data/local/tmp/{filename}'", shell=True, check=True)
+        subprocess.run(f"{ADB} root", shell=True, capture_output=True, text=True)
+        result = subprocess.run(f"{ADB} shell su -c 'magisk --install-module /data/local/tmp/{filename}'", shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            # Fallback: try without su (adb root may have worked)
+            result = subprocess.run(f"{ADB} shell magisk --install-module /data/local/tmp/{filename}", shell=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"\033[1;33m[!] Module install warning: {result.stderr.strip()}\033[0m")
         print("\033[1;32m[✓] Magisk Module Installed\033[0m\n")
 
         print("\033[1;33m→ YOU MUST INSTALL THE CERTIFICATE MANUALLY!\033[0m")
@@ -605,19 +617,27 @@ def install_magisk_and_patch_rootavd():
         print("\033[1;32m[✓] rootAVD Extracted Successfully\033[0m\n")
 
         print("\033[1;36m[•] Generating System Image List...\033[0m")
-        bat_path = os.path.join(extract_dir, "rootAVD-master", "rootAVD.bat")
-        bat_dir = os.path.dirname(bat_path)
+        is_windows = platform.system() == "Windows"
+        script_name = "rootAVD.bat" if is_windows else "rootAVD.sh"
+        script_path = os.path.join(extract_dir, "rootAVD-master", script_name)
+        script_dir = os.path.dirname(script_path)
         cwd = os.getcwd()
-        os.chdir(bat_dir)
-        result = subprocess.run('cmd /c "rootAVD.bat ListAllAVDs"', shell=True, capture_output=True, text=True)
+        os.chdir(script_dir)
+        if is_windows:
+            cmd = f'cmd /c "{script_name} ListAllAVDs"'
+        else:
+            cmd = f'bash {script_name} ListAllAVDs'
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         os.chdir(cwd)
         
-        with open(os.path.join(bat_dir, "rootAVD_list.txt"), "w") as f:
+        with open(os.path.join(script_dir, "rootAVD_list.txt"), "w") as f:
             f.write(result.stdout)
         
         image_paths = set()
+        prefix = f"{script_name} system-images\\" if is_windows else f"./{script_name} system-images/"
         for line in result.stdout.splitlines():
-            if line.startswith("rootAVD.bat system-images\\") and "ramdisk.img" in line:
+            line = strip_ansi(line)
+            if line.startswith(prefix) and "ramdisk.img" in line:
                 path = line.split()[1].split("ramdisk.img")[0] + "ramdisk.img"
                 image_paths.add(path)
         image_paths = sorted(image_paths)
@@ -638,24 +658,69 @@ def install_magisk_and_patch_rootavd():
         print("\033[1;33m1. Copy a path from the list above or open Android Studio → Device Manager → Virtual Tab\033[0m")
         print("\033[1;33m2. Select your emulator (API 31, x86_64/arm64)\033[0m")
         print("\033[1;33m3. Click the pencil icon to view details\033[0m")
-        print("\033[1;33m4. Note the 'System Image' path (e.g., system-images\\android-31\\google_apis\\x86_64\\ramdisk.img)\033[0m")
+        if is_windows:
+            example_path = "system-images\\android-31\\google_apis\\x86_64\\ramdisk.img"
+        else:
+            example_path = "system-images/android-31/google_apis/arm64-v8a/ramdisk.img"
+        print(f"\033[1;33m4. Note the 'System Image' path (e.g., {example_path})\033[0m")
         print("\033[1;37m→ Why API 31? Ensures compatibility with Magisk and Frida.\033[0m\n")
         img_path = input("\033[1;36mEnter System Image Path: \033[0m").strip()
 
-        android_home = os.environ.get("ANDROID_HOME", os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk"))
-        full_img_path = os.path.normpath(os.path.join(android_home, img_path))
+        if is_windows:
+            default_sdk = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk")
+        else:
+            default_sdk = os.path.join(os.path.expanduser("~"), "Library", "Android", "sdk")
+        android_home_env = os.environ.get("ANDROID_HOME", "")
+
+        # Resolve the correct SDK root and relative path
+        full_img_path = os.path.normpath(img_path if os.path.isabs(img_path) else os.path.join(android_home_env or default_sdk, img_path))
+
+        # If user gave absolute path, try to convert to relative + detect correct SDK root
+        if os.path.isabs(img_path):
+            # Check known SDK roots for the correct one
+            sdk_roots = []
+            if android_home_env:
+                sdk_roots.append(android_home_env)
+            sdk_roots.append(default_sdk)
+            found_root = None
+            rel_path = None
+            for root in sdk_roots:
+                root_norm = os.path.normpath(root)
+                if full_img_path.startswith(root_norm + os.sep):
+                    found_root = root_norm
+                    rel_path = os.path.relpath(full_img_path, root_norm)
+                    break
+            if found_root and rel_path:
+                android_home = found_root
+                img_path = rel_path
+            else:
+                android_home = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(full_img_path))))
+                img_path = os.path.relpath(full_img_path, android_home)
+        else:
+            android_home = android_home_env or default_sdk
+            full_img_path = os.path.normpath(os.path.join(android_home, img_path))
+
         if not os.path.exists(full_img_path):
             print(f"\033[1;31m[✖] Invalid Path: {img_path} does not exist\033[0m")
             print(f"\033[1;33m→ Tried: {full_img_path}\033[0m")
             print("\033[1;33m→ Verify the path in the list above or Android Studio Device Manager.\033[0m")
-            print("\033[1;37m→ Ensure ANDROID_HOME is set or system images are in %LOCALAPPDATA%\\Android\\Sdk.\033[0m")
+            if is_windows:
+                print("\033[1;37m→ Ensure ANDROID_HOME is set or system images are in %LOCALAPPDATA%\\Android\\Sdk.\033[0m")
+            else:
+                print("\033[1;37m→ Ensure ANDROID_HOME is set or system images are in ~/Library/Android/sdk.\033[0m")
             input("\033[96m→ Press Enter to return to the menu...\033[0m")
             return
         print("\033[1;32m[✓] Valid System Image Path Provided\033[0m\n")
 
         print("\033[1;36m[•] Patching Emulator System Image...\033[0m")
-        os.chdir(bat_dir)
-        result = subprocess.run(f'cmd /c ".\\rootAVD.bat {img_path}"', shell=True, capture_output=True, text=True)
+        os.chdir(script_dir)
+        env = os.environ.copy()
+        env["ANDROID_HOME"] = android_home
+        if is_windows:
+            patch_cmd = f'cmd /c ".\\rootAVD.bat {img_path}"'
+        else:
+            patch_cmd = f'bash ./rootAVD.sh "{img_path}"'
+        result = subprocess.run(patch_cmd, shell=True, capture_output=True, text=True, env=env)
         os.chdir(cwd)
         if result.returncode != 0:
             print(f"\033[1;31m[✖] Failed to Patch System Image: {result.stderr}\033[0m")
@@ -683,25 +748,63 @@ def install_magisk_and_patch_rootavd():
         print("\033[1;32m[✓] Emulator Connected Successfully\033[0m\n")
 
         print("\033[1;36m[•] Verifying Root Access...\033[0m")
-        result = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
-        if result.returncode != 0 or result.stdout.strip() != "Root granted":
-            print(f"\033[1;31m[✖] Root Access Not Detected: {result.stderr}\033[0m")
-            print("\033[1;33m→ Ensure Magisk is installed and the system image was patched correctly.\033[0m")
-            print("\033[1;37m→ Try re-patching the system image or reinstalling Magisk.\033[0m")
-            input("\033[96m→ Press Enter to return to the menu...\033[0m")
-            return
-        print("\033[1;32m[✓] Root Access Confirmed\033[0m\n")
+        time.sleep(2)  # Wait for adb stability after cold boot
+        result = subprocess.run("adb root", shell=True, capture_output=True, text=True)
+        # After adb root, adbd restarts — wait for device to come back
+        for _ in range(10):
+            state = subprocess.run("adb devices", shell=True, capture_output=True, text=True)
+            lines = [l.strip() for l in state.stdout.strip().split("\n") if l.strip()]
+            if any("device" in l and "emulator" in l for l in lines[1:]):
+                break
+            time.sleep(2)
+        time.sleep(1)
+        verify = subprocess.run("adb shell 'echo Root granted'", shell=True, capture_output=True, text=True)
+        if verify.returncode == 0 and verify.stdout.strip() == "Root granted":
+            print("\033[1;32m[✓] Root Access Confirmed\033[0m\n")
+        else:
+            result = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip() == "Root granted":
+                print("\033[1;32m[✓] Root Access Confirmed (via su)\033[0m\n")
+            else:
+                magisk_check = subprocess.run("adb shell ls /data/adb/magisk/ 2>/dev/null", shell=True, capture_output=True, text=True)
+                if magisk_check.returncode == 0:
+                    print("\033[1;33m[!] Magisk detected but su not ready yet.\033[0m")
+                    print("\033[1;33m→ This is normal — Magisk needs app setup to complete.\033[0m\n")
+                else:
+                    print(f"\033[1;31m[✖] Root Access Not Detected\033[0m")
+                    print("\033[1;33m→ Ensure Magisk is installed and the system image was patched correctly.\033[0m")
+                    print("\033[1;37m→ Try re-patching the system image or reinstalling Magisk.\033[0m")
+                    input("\033[96m→ Press Enter to return to the menu...\033[0m")
+                    return
 
-        print("\033[1;33m→ YOU MUST FINALIZE ROOT IN MAGISK!\033[0m")
-        print("\033[1;33m1. Open the Magisk app on the emulator\033[0m")
-        print("\033[1;33m2. Click 'OK' on the setup popup\033[0m")
-        print("\033[1;33m3. Allow the emulator to reboot automatically\033[0m")
-        print("\033[1;37m→ Note: This completes the rooting process.\033[0m\n")
-        print("\033[1;33mWaiting 30s for Magisk Setup...\033[0m")
-        for i in range(30, 0, -1):
-            print(f"\r\033[1;36m  {i}s left...\033[0m", end="", flush=True)
+        print("\033[1;33m→ Launching Magisk app to complete setup...\033[0m")
+        for activity in ["com.topjohnwu.magisk/.ui.MainActivity", "com.topjohnwu.magisk/.MainActivity"]:
+            launch = subprocess.run(
+                f'adb shell am start -n "{activity}" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER',
+                shell=True, capture_output=True, text=True)
+            if "Error" not in launch.stderr and "Error" not in launch.stdout:
+                break
             time.sleep(1)
-        print("\r\033[1;32m[✓] Root Setup Complete\033[0m")
+        print("\033[1;33m→ Magisk app launched. Click 'OK' on 'Additional Setup' if prompted.\033[0m")
+        print("\033[1;33m→ Monitoring for setup completion or reboot...\033[0m\n")
+        setup_done = False
+        for i in range(30, 0, -1):
+            time.sleep(2)
+            magisk_proc = subprocess.run("adb shell 'ps -A 2>/dev/null | grep com.topjohnwu.magisk | head -1'",
+                                         shell=True, capture_output=True, text=True)
+            if not magisk_proc.stdout.strip() or magisk_proc.returncode != 0:
+                print(f"\r\033[1;36m  Magisk app closed — checking setup...\033[0m")
+                time.sleep(3)
+                verify2 = subprocess.run("adb shell 'magisk -c' 2>/dev/null", shell=True, capture_output=True, text=True)
+                if verify2.returncode == 0 and verify2.stdout.strip():
+                    print(f"\r\033[1;36m  Magisk version detected: {verify2.stdout.strip()}  \033[0m")
+                    setup_done = True
+                    break
+            print(f"\r\033[1;36m  Waiting for Magisk setup... ({i}s left)\033[0m", end="", flush=True)
+        if setup_done:
+            print("\n\033[1;32m[✓] Root Setup Complete\033[0m")
+        else:
+            print("\n\033[1;33m[!] Setup timeout. Verify Magisk manually on the emulator.\033[0m")
     except Exception as e:
         print(f"\033[1;31m[✖] Rooting Failed: {e}\033[0m")
         print("\033[1;33m→ Troubleshoot: Check emulator status, internet connection, and logs in rootAVD_list.txt.\033[0m")
@@ -885,8 +988,14 @@ def frida_tool_options():
             
             print("\033[1;32m[✓] Emulator Detected\033[0m")
             print("\033[1;36m[•] Requesting Root Access...\033[0m")
-            result = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
-            if result.returncode != 0 or result.stdout.strip() != "Root granted":
+            root_result = subprocess.run("adb root", shell=True, capture_output=True, text=True)
+            if root_result.returncode == 0:
+                verify = subprocess.run("adb shell 'echo Root granted'", shell=True, capture_output=True, text=True)
+                root_ok = (verify.returncode == 0 and verify.stdout.strip() == "Root granted")
+            else:
+                verify = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
+                root_ok = (verify.returncode == 0 and verify.stdout.strip() == "Root granted")
+            if not root_ok:
                 print("\033[1;31m[✖] Root Access Not Detected\033[0m")
                 print("\033[1;33m→ Ensure emulator is rooted with Magisk.\033[0m")
                 input("\033[1;36m→ Press Enter to continue...\033[0m")
@@ -938,8 +1047,14 @@ def frida_tool_options():
             
             print("\033[1;32m[✓] Emulator Detected\033[0m")
             print("\033[1;36m[•] Requesting Root Access...\033[0m")
-            result = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
-            if result.returncode != 0 or result.stdout.strip() != "Root granted":
+            root_result = subprocess.run("adb root", shell=True, capture_output=True, text=True)
+            if root_result.returncode == 0:
+                verify = subprocess.run("adb shell 'echo Root granted'", shell=True, capture_output=True, text=True)
+                root_ok = (verify.returncode == 0 and verify.stdout.strip() == "Root granted")
+            else:
+                verify = subprocess.run("adb shell su -c 'echo Root granted'", shell=True, capture_output=True, text=True)
+                root_ok = (verify.returncode == 0 and verify.stdout.strip() == "Root granted")
+            if not root_ok:
                 print("\033[1;31m[✖] Root Access Not Detected\033[0m")
                 print("\033[1;33m→ Ensure emulator is rooted with Magisk.\033[0m")
                 input("\033[1;36m→ Press Enter to continue...\033[0m")
